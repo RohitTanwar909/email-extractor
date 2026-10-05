@@ -1,10 +1,34 @@
-from flask import Flask, request, render_template_string
-import requests
+```python
+import os
 import re
+import ipaddress
+import socket
+from urllib.parse import urlparse, urlunparse
+
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
+
 
 app = Flask(__name__)
+CORS(app)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+
+# Optional:
+# API_KEY=your-secret-key
+#
+# If API_KEY is not configured, API authentication is disabled.
+API_KEY = os.getenv("API_KEY", "").strip()
+
+MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5 MB
+
 
 HEADERS = {
     "User-Agent": (
@@ -12,31 +36,55 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/154.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
 }
 
+
+# ============================================================
+# REGEX
+# ============================================================
 
 EMAIL_REGEX = re.compile(
-    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+    r"\b[A-Za-z0-9._%+-]+"
+    r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 )
 
-PHONE_REGEX = re.compile(
-    r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)"
+
+# This regex is deliberately NOT used against arbitrary page text.
+#
+# Generic phone regexes cause false positives such as:
+#
+# 1997 - 2001
+# 2001 - 2003
+# 2024 - 2025
+#
+# For safety/accuracy, this application primarily trusts:
+#
+# tel:+123456789
+#
+# links.
+TEL_ALLOWED_REGEX = re.compile(
+    r"^\+?[0-9][0-9\s().-]{6,20}$"
 )
 
-SOCIAL_DOMAINS = {
-    "linkedin.com": "LinkedIn",
-    "twitter.com": "Twitter",
-    "x.com": "X",
-    "facebook.com": "Facebook",
-    "instagram.com": "Instagram",
-    "youtube.com": "YouTube",
-    "github.com": "GitHub",
-}
 
+# ============================================================
+# URL HELPERS
+# ============================================================
 
 def normalize_url(url):
+    """
+    Normalize and validate a user-supplied URL.
+    """
+
+    if not isinstance(url, str):
+        return None
+
     url = url.strip()
 
     if not url:
@@ -45,7 +93,10 @@ def normalize_url(url):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
 
     if parsed.scheme not in ("http", "https"):
         return None
@@ -53,679 +104,1593 @@ def normalize_url(url):
     if not parsed.netloc:
         return None
 
+    # Do not allow credentials inside URLs.
+    if parsed.username or parsed.password:
+        return None
+
     return url
 
 
+def hostname_is_private(hostname):
+    """
+    Prevent requests to localhost/private/internal addresses.
+
+    This is important because the application accepts arbitrary URLs.
+    """
+
+    if not hostname:
+        return True
+
+    hostname = hostname.strip().lower()
+
+    if hostname == "localhost":
+        return True
+
+    if hostname.endswith(".localhost"):
+        return True
+
+    if hostname.endswith(".local"):
+        return True
+
+    # Direct IP address
+    try:
+        ip = ipaddress.ip_address(hostname)
+
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return True
+
+        return False
+
+    except ValueError:
+        pass
+
+    # Resolve hostname and check resulting addresses.
+    try:
+        addresses = socket.getaddrinfo(
+            hostname,
+            None,
+            proto=socket.IPPROTO_TCP
+        )
+
+        for item in addresses:
+            address = item[4][0]
+
+            try:
+                ip = ipaddress.ip_address(address)
+
+                if (
+                    ip.is_private
+                    or ip.is_loopback
+                    or ip.is_link_local
+                    or ip.is_reserved
+                    or ip.is_multicast
+                    or ip.is_unspecified
+                ):
+                    return True
+
+            except ValueError:
+                continue
+
+    except Exception:
+        # If DNS resolution fails, requests will report the error.
+        pass
+
+    return False
+
+
+def validate_target_url(url):
+    """
+    Validate URL and prevent obvious SSRF targets.
+    """
+
+    normalized = normalize_url(url)
+
+    if not normalized:
+        return None, "Invalid HTTP/HTTPS URL."
+
+    parsed = urlparse(normalized)
+
+    if hostname_is_private(parsed.hostname):
+        return None, "Private, local, or internal addresses are not allowed."
+
+    return normalized, None
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
 def clean_text(value):
-    if not value:
+    if value is None:
         return ""
+
+    value = str(value)
 
     return re.sub(r"\s+", " ", value).strip()
 
 
 def unique(items):
     result = []
+    seen = set()
 
     for item in items:
         item = clean_text(item)
 
-        if item and item not in result:
+        if not item:
+            continue
+
+        if item not in seen:
+            seen.add(item)
             result.append(item)
 
     return result
 
 
-def extract_data(html, final_url):
-    soup = BeautifulSoup(html, "html.parser")
+def normalize_hostname(hostname):
+    if not hostname:
+        return ""
 
-    # Remove non-visible/noisy elements
-    for element in soup(["script", "style", "noscript", "svg"]):
-        element.decompose()
+    hostname = hostname.lower().strip()
 
-    visible_text = clean_text(soup.get_text(" ", strip=True))
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
 
-    # ---------------------------------------------------------
-    # Title
-    # ---------------------------------------------------------
+    return hostname
 
-    title = ""
 
-    if soup.title:
-        title = clean_text(soup.title.get_text())
+def same_domain(url1, url2):
+    try:
+        host1 = normalize_hostname(urlparse(url1).netloc)
+        host2 = normalize_hostname(urlparse(url2).netloc)
 
-    # ---------------------------------------------------------
-    # Meta description
-    # ---------------------------------------------------------
+        return host1 == host2
 
-    description = ""
+    except Exception:
+        return False
 
-    meta_description = soup.find(
-        "meta",
-        attrs={"name": re.compile("^description$", re.I)}
-    )
 
-    if meta_description:
-        description = clean_text(
-            meta_description.get("content", "")
+# ============================================================
+# LINKEDIN HELPERS
+# ============================================================
+
+def is_linkedin_domain(url):
+    try:
+        hostname = normalize_hostname(urlparse(url).netloc)
+
+        return (
+            hostname == "linkedin.com"
+            or hostname.endswith(".linkedin.com")
         )
 
-    # ---------------------------------------------------------
-    # OpenGraph information
-    # ---------------------------------------------------------
+    except Exception:
+        return False
 
-    og_title = ""
-    og_description = ""
-    og_image = ""
 
-    meta_og_title = soup.find(
-        "meta",
-        attrs={"property": "og:title"}
-    )
+def is_linkedin_person_profile(url):
+    """
+    True only for URLs resembling:
 
-    meta_og_description = soup.find(
-        "meta",
-        attrs={"property": "og:description"}
-    )
+    https://www.linkedin.com/in/username
 
-    meta_og_image = soup.find(
-        "meta",
-        attrs={"property": "og:image"}
-    )
+    Does NOT accept:
 
-    if meta_og_title:
-        og_title = clean_text(meta_og_title.get("content", ""))
+    /login
+    /signup
+    /jobs
+    /learning
+    /company
+    /posts
+    /top-content
+    /pub/dir
+    etc.
+    """
 
-    if meta_og_description:
-        og_description = clean_text(
-            meta_og_description.get("content", "")
+    try:
+        parsed = urlparse(url)
+
+        hostname = normalize_hostname(parsed.netloc)
+
+        if hostname != "linkedin.com":
+            return False
+
+        path = parsed.path.rstrip("/")
+
+        return bool(
+            re.fullmatch(
+                r"/in/[A-Za-z0-9_-]+",
+                path,
+                re.IGNORECASE
+            )
         )
 
-    if meta_og_image:
-        og_image = clean_text(
-            meta_og_image.get("content", "")
+    except Exception:
+        return False
+
+
+def is_linkedin_company(url):
+    try:
+        parsed = urlparse(url)
+
+        hostname = normalize_hostname(parsed.netloc)
+
+        if hostname != "linkedin.com":
+            return False
+
+        path = parsed.path.rstrip("/")
+
+        return bool(
+            re.fullmatch(
+                r"/company/[A-Za-z0-9_-]+",
+                path,
+                re.IGNORECASE
+            )
         )
 
-    # ---------------------------------------------------------
-    # Emails
-    # ---------------------------------------------------------
+    except Exception:
+        return False
 
-    emails = set(
-        match.lower()
-        for match in EMAIL_REGEX.findall(html)
+
+def is_linkedin_post(url):
+    try:
+        parsed = urlparse(url)
+
+        hostname = normalize_hostname(parsed.netloc)
+
+        if hostname != "linkedin.com":
+            return False
+
+        return parsed.path.startswith("/posts/")
+
+    except Exception:
+        return False
+
+
+def clean_linkedin_profile_url(url):
+    """
+    Remove tracking query parameters from a LinkedIn profile URL.
+    """
+
+    if not is_linkedin_person_profile(url):
+        return None
+
+    parsed = urlparse(url)
+
+    return urlunparse(
+        (
+            "https",
+            "www.linkedin.com",
+            parsed.path.rstrip("/"),
+            "",
+            "",
+            ""
+        )
     )
 
-    # Also inspect mailto links
+
+# ============================================================
+# PHONE EXTRACTION
+# ============================================================
+
+def extract_phones(soup):
+    """
+    IMPORTANT:
+
+    We intentionally do NOT search arbitrary page text for phone-like
+    numbers.
+
+    That prevents false positives such as:
+
+        1997 - 2001
+        2001 - 2003
+        2024 - 2025
+
+    The safest public HTML signal is an explicit tel: link.
+    """
+
+    phones = set()
+
     for link in soup.find_all("a", href=True):
-        href = link["href"].strip()
+
+        href = clean_text(link.get("href", ""))
+
+        if not href:
+            continue
+
+        if not href.lower().startswith("tel:"):
+            continue
+
+        phone = href[4:].split("?", 1)[0].strip()
+
+        if not phone:
+            continue
+
+        # Decode basic HTML entities if any.
+        phone = clean_text(phone)
+
+        # Validate the actual telephone value.
+        if not TEL_ALLOWED_REGEX.fullmatch(phone):
+            continue
+
+        digits = re.sub(r"\D", "", phone)
+
+        # E.164/general international range.
+        if not (8 <= len(digits) <= 15):
+            continue
+
+        phones.add(phone)
+
+    return sorted(phones)
+
+
+# ============================================================
+# EMAIL EXTRACTION
+# ============================================================
+
+def extract_emails(soup, html):
+    """
+    Extract emails actually exposed in the returned HTML.
+
+    Sources:
+      - mailto links
+      - visible/raw HTML email strings
+    """
+
+    emails = set()
+
+    # mailto links
+    for link in soup.find_all("a", href=True):
+
+        href = clean_text(link.get("href", ""))
 
         if href.lower().startswith("mailto:"):
-            email = href[7:].split("?")[0].strip()
+
+            email = href[7:].split("?", 1)[0].strip()
 
             if EMAIL_REGEX.fullmatch(email):
                 emails.add(email.lower())
 
-    # ---------------------------------------------------------
-    # Phone numbers
-    # ---------------------------------------------------------
+    # Raw HTML
+    for email in EMAIL_REGEX.findall(html):
+        emails.add(email.lower())
 
-    phones = set()
+    return sorted(emails)
 
-    # tel: links are stronger evidence than arbitrary numbers
-    for link in soup.find_all("a", href=True):
-        href = link["href"].strip()
 
-        if href.lower().startswith("tel:"):
-            phone = href[4:].split("?")[0].strip()
+# ============================================================
+# NAME EXTRACTION
+# ============================================================
 
-            if phone:
-                phones.add(phone)
-
-    # Find phone-like strings in returned HTML/text
-    for match in PHONE_REGEX.findall(visible_text):
-        cleaned = clean_text(match)
-
-        digits = re.sub(r"\D", "", cleaned)
-
-        # Avoid treating years or tiny numbers as phone numbers
-        if len(digits) >= 8:
-            phones.add(cleaned)
-
-    # ---------------------------------------------------------
-    # Name candidates
-    # ---------------------------------------------------------
-
+def extract_name_candidates(soup, title, og_title):
     names = []
 
-    # OpenGraph title is often useful
+    # h1 values
+    for h1 in soup.find_all("h1"):
+
+        value = clean_text(h1.get_text(" ", strip=True))
+
+        if value:
+            names.append(value)
+
+    # OpenGraph title
     if og_title:
         names.append(og_title)
 
-    # H1
-    for h1 in soup.find_all("h1"):
-        text = clean_text(h1.get_text())
+    # Page title
+    if title:
+        names.append(title)
 
-        if text:
-            names.append(text)
+    return unique(names)[:20]
 
-    # ---------------------------------------------------------
-    # Links
-    # ---------------------------------------------------------
 
-    links = []
+# ============================================================
+# METADATA
+# ============================================================
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
+def get_meta_content(soup, *, name=None, property_name=None):
+
+    tag = None
+
+    if name:
+        tag = soup.find(
+            "meta",
+            attrs={
+                "name": re.compile(
+                    "^" + re.escape(name) + "$",
+                    re.IGNORECASE
+                )
+            }
+        )
+
+    elif property_name:
+        tag = soup.find(
+            "meta",
+            attrs={
+                "property": re.compile(
+                    "^" + re.escape(property_name) + "$",
+                    re.IGNORECASE
+                )
+            }
+        )
+
+    if not tag:
+        return ""
+
+    return clean_text(tag.get("content", ""))
+
+
+# ============================================================
+# LINK EXTRACTION
+# ============================================================
+
+def extract_links(soup, source_url):
+    """
+    Extract useful links while filtering navigation noise.
+    """
+
+    all_links = []
+    linkedin_profiles = []
+    linkedin_companies = []
+    linkedin_posts = []
+    external_websites = []
+
+    source_domain = normalize_hostname(
+        urlparse(source_url).netloc
+    )
+
+    for anchor in soup.find_all("a", href=True):
+
+        href = anchor.get("href", "").strip()
+
+        if not href:
+            continue
+
+        # Only HTTP(S)
+        if not href.startswith(("http://", "https://")):
+            continue
+
+        try:
+            parsed = urlparse(href)
+
+        except Exception:
+            continue
+
+        if not parsed.netloc:
+            continue
+
+        # LinkedIn
+        if is_linkedin_person_profile(href):
+
+            cleaned = clean_linkedin_profile_url(href)
+
+            if cleaned:
+                linkedin_profiles.append(cleaned)
+
+            continue
+
+        if is_linkedin_company(href):
+
+            linkedin_companies.append(href)
+
+            continue
+
+        if is_linkedin_post(href):
+
+            linkedin_posts.append(href)
+
+            continue
+
+        # Ignore other LinkedIn navigation URLs.
+        if is_linkedin_domain(href):
+            continue
+
+        # External website
+        domain = normalize_hostname(parsed.netloc)
+
+        if domain and domain != source_domain:
+
+            external_websites.append(href)
+
+        all_links.append(href)
+
+    return {
+        "linkedin_profiles": unique(linkedin_profiles),
+        "linkedin_companies": unique(linkedin_companies),
+        "linkedin_posts": unique(linkedin_posts),
+        "external_websites": unique(external_websites),
+    }
+
+
+# ============================================================
+# SOCIAL PROFILE EXTRACTION
+# ============================================================
+
+SOCIAL_DOMAINS = {
+    "twitter.com": "Twitter",
+    "x.com": "X",
+    "facebook.com": "Facebook",
+    "instagram.com": "Instagram",
+    "youtube.com": "YouTube",
+    "github.com": "GitHub",
+    "tiktok.com": "TikTok",
+}
+
+
+def extract_social_profiles(soup):
+    profiles = []
+    seen = set()
+
+    for anchor in soup.find_all("a", href=True):
+
+        href = anchor.get("href", "").strip()
 
         if not href.startswith(("http://", "https://")):
             continue
 
-        links.append(href)
+        try:
+            parsed = urlparse(href)
+        except Exception:
+            continue
 
-    links = unique(links)
+        hostname = normalize_hostname(parsed.netloc)
 
-    # ---------------------------------------------------------
-    # Social profiles
-    # ---------------------------------------------------------
+        if not hostname:
+            continue
 
-    social_profiles = []
-
-    for link in links:
-        parsed = urlparse(link)
-        hostname = parsed.netloc.lower()
-
-        if hostname.startswith("www."):
-            hostname = hostname[4:]
+        platform = None
 
         for domain, name in SOCIAL_DOMAINS.items():
-            if hostname == domain or hostname.endswith("." + domain):
-                social_profiles.append({
-                    "name": name,
-                    "url": link
-                })
+
+            if (
+                hostname == domain
+                or hostname.endswith("." + domain)
+            ):
+                platform = name
                 break
 
-    # Remove duplicate social URLs
-    seen_social = set()
-    clean_social = []
-
-    for item in social_profiles:
-        if item["url"] not in seen_social:
-            seen_social.add(item["url"])
-            clean_social.append(item)
-
-    # ---------------------------------------------------------
-    # Website links
-    # ---------------------------------------------------------
-
-    websites = []
-
-    source_domain = urlparse(final_url).netloc.lower()
-
-    for link in links:
-        domain = urlparse(link).netloc.lower()
-
-        if not domain:
+        if not platform:
             continue
 
-        if domain == source_domain:
+        if href in seen:
             continue
 
-        is_social = any(
-            domain == d or domain.endswith("." + d)
-            for d in SOCIAL_DOMAINS
-        )
+        seen.add(href)
 
-        if not is_social:
-            websites.append(link)
+        profiles.append({
+            "platform": platform,
+            "url": href
+        })
 
-    websites = unique(websites)
+    return profiles
 
-    # ---------------------------------------------------------
-    # JSON-LD structured data
-    # ---------------------------------------------------------
 
-    structured_data = []
+# ============================================================
+# STRUCTURED DATA
+# ============================================================
+
+def extract_structured_data(soup):
+    data = []
 
     for script in soup.find_all(
         "script",
-        attrs={"type": "application/ld+json"}
+        attrs={
+            "type": re.compile(
+                r"application/ld\+json",
+                re.IGNORECASE
+            )
+        }
     ):
-        if script.string:
-            text = clean_text(script.string)
 
-            if text:
-                structured_data.append(text[:5000])
+        content = script.string or script.get_text()
+
+        content = clean_text(content)
+
+        if not content:
+            continue
+
+        data.append(content[:10000])
+
+    return data[:10]
+
+
+# ============================================================
+# MAIN EXTRACTION
+# ============================================================
+
+def extract_data(html, final_url):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Create a copy for visible text.
+    text_soup = BeautifulSoup(html, "html.parser")
+
+    for element in text_soup(
+        ["script", "style", "noscript", "svg", "template"]
+    ):
+        element.decompose()
+
+    visible_text = clean_text(
+        text_soup.get_text(" ", strip=True)
+    )
+
+    # --------------------------------------------------------
+    # Basic title
+    # --------------------------------------------------------
+
+    title = ""
+
+    if soup.title:
+        title = clean_text(
+            soup.title.get_text(" ", strip=True)
+        )
+
+    # --------------------------------------------------------
+    # Meta description
+    # --------------------------------------------------------
+
+    description = get_meta_content(
+        soup,
+        name="description"
+    )
+
+    # --------------------------------------------------------
+    # OpenGraph
+    # --------------------------------------------------------
+
+    og_title = get_meta_content(
+        soup,
+        property_name="og:title"
+    )
+
+    og_description = get_meta_content(
+        soup,
+        property_name="og:description"
+    )
+
+    og_image = get_meta_content(
+        soup,
+        property_name="og:image"
+    )
+
+    # --------------------------------------------------------
+    # Contact
+    # --------------------------------------------------------
+
+    emails = extract_emails(
+        soup,
+        html
+    )
+
+    phones = extract_phones(
+        soup
+    )
+
+    # --------------------------------------------------------
+    # Names
+    # --------------------------------------------------------
+
+    names = extract_name_candidates(
+        soup,
+        title,
+        og_title
+    )
+
+    # --------------------------------------------------------
+    # Links
+    # --------------------------------------------------------
+
+    links = extract_links(
+        soup,
+        final_url
+    )
+
+    # --------------------------------------------------------
+    # Social profiles
+    # --------------------------------------------------------
+
+    social_profiles = extract_social_profiles(
+        soup
+    )
+
+    # --------------------------------------------------------
+    # Structured data
+    # --------------------------------------------------------
+
+    structured_data = extract_structured_data(
+        soup
+    )
+
+    # --------------------------------------------------------
+    # LinkedIn main profile
+    # --------------------------------------------------------
+
+    linkedin_profile = None
+
+    if is_linkedin_person_profile(final_url):
+        linkedin_profile = clean_linkedin_profile_url(
+            final_url
+        )
+
+    elif links["linkedin_profiles"]:
+        linkedin_profile = links["linkedin_profiles"][0]
+
+    # --------------------------------------------------------
+    # Return result
+    # --------------------------------------------------------
 
     return {
-        "title": title,
-        "description": description,
-        "og_title": og_title,
-        "og_description": og_description,
-        "og_image": og_image,
-        "emails": sorted(emails),
-        "phones": sorted(phones),
-        "names": unique(names),
-        "social_profiles": clean_social,
-        "websites": websites[:50],
-        "structured_data": structured_data[:10],
-        "page_text_preview": visible_text[:3000],
+        "success": True,
+
+        "source": {
+            "url": final_url,
+            "data_source": "public_http_html_only"
+        },
+
+        "profile": {
+            "name_candidates": names,
+            "title": title,
+            "description": description,
+            "og_title": og_title,
+            "og_description": og_description,
+            "og_image": og_image
+        },
+
+        "contact": {
+            "emails": emails,
+            "phones": phones
+        },
+
+        "linkedin": {
+            "profile": linkedin_profile,
+            "profiles_found": links["linkedin_profiles"][:20],
+            "companies_found": links["linkedin_companies"][:20],
+            "posts_found": links["linkedin_posts"][:20]
+        },
+
+        "social_profiles": social_profiles[:50],
+
+        "external_websites": links[
+            "external_websites"
+        ][:50],
+
+        "structured_data": structured_data,
+
+        "page_text_preview": visible_text[:5000]
     }
 
 
+# ============================================================
+# API AUTHENTICATION
+# ============================================================
+
+def check_api_key():
+
+    # Authentication disabled if API_KEY isn't configured.
+    if not API_KEY:
+        return True
+
+    supplied_key = (
+        request.headers.get("X-API-Key")
+        or request.args.get("api_key")
+    )
+
+    if supplied_key == API_KEY:
+        return True
+
+    return False
+
+
+# ============================================================
+# FETCH PAGE
+# ============================================================
+
+def fetch_page(url):
+
+    validated_url, error = validate_target_url(url)
+
+    if error:
+        raise ValueError(error)
+
+    response = requests.get(
+        validated_url,
+        headers=HEADERS,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+        stream=True
+    )
+
+    # Check HTTP status.
+    if response.status_code >= 400:
+        raise ValueError(
+            f"Target website returned HTTP "
+            f"{response.status_code}."
+        )
+
+    content_type = response.headers.get(
+        "Content-Type",
+        ""
+    ).lower()
+
+    if "text/html" not in content_type:
+        raise ValueError(
+            "The supplied URL did not return an HTML page."
+        )
+
+    # Read with a maximum size.
+    content = bytearray()
+
+    for chunk in response.iter_content(
+        chunk_size=65536
+    ):
+
+        if not chunk:
+            continue
+
+        content.extend(chunk)
+
+        if len(content) > MAX_RESPONSE_SIZE:
+            raise ValueError(
+                "The HTML response is larger than the allowed limit."
+            )
+
+    response.close()
+
+    encoding = response.encoding or "utf-8"
+
+    html = bytes(content).decode(
+        encoding,
+        errors="replace"
+    )
+
+    return html, response.url
+
+
+# ============================================================
+# API ENDPOINT
+# ============================================================
+
+@app.route("/api/extract", methods=["GET", "POST"])
+def api_extract():
+
+    if not check_api_key():
+
+        return jsonify({
+            "success": False,
+            "error": "Invalid or missing API key."
+        }), 401
+
+    # --------------------------------------------------------
+    # GET
+    # --------------------------------------------------------
+
+    if request.method == "GET":
+
+        url = request.args.get(
+            "url",
+            ""
+        ).strip()
+
+    # --------------------------------------------------------
+    # POST
+    # --------------------------------------------------------
+
+    else:
+
+        url = ""
+
+        # JSON body
+        if request.is_json:
+
+            body = request.get_json(
+                silent=True
+            ) or {}
+
+            url = str(
+                body.get("url", "")
+            ).strip()
+
+        # Form body
+        if not url:
+
+            url = request.form.get(
+                "url",
+                ""
+            ).strip()
+
+    if not url:
+
+        return jsonify({
+            "success": False,
+            "error": "Missing required parameter: url"
+        }), 400
+
+    try:
+
+        html, final_url = fetch_page(
+            url
+        )
+
+        result = extract_data(
+            html,
+            final_url
+        )
+
+        return jsonify(result)
+
+    except requests.exceptions.Timeout:
+
+        return jsonify({
+            "success": False,
+            "error": "The target website timed out."
+        }), 504
+
+    except requests.exceptions.ConnectionError:
+
+        return jsonify({
+            "success": False,
+            "error": "Could not connect to the target website."
+        }), 502
+
+    except requests.exceptions.RequestException as exc:
+
+        return jsonify({
+            "success": False,
+            "error": f"Request failed: {str(exc)}"
+        }), 502
+
+    except ValueError as exc:
+
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 400
+
+    except Exception as exc:
+
+        return jsonify({
+            "success": False,
+            "error": f"Unexpected error: {str(exc)}"
+        }), 500
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/health", methods=["GET"])
+def health():
+
+    return jsonify({
+        "success": True,
+        "service": "Public Profile Inspector",
+        "status": "ok"
+    })
+
+
+# ============================================================
+# WEB INTERFACE
+# ============================================================
+
 HTML = r"""
 <!DOCTYPE html>
+
 <html lang="en">
+
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    <title>Public Profile Inspector</title>
+<meta charset="UTF-8">
 
-    <style>
-        * {
-            box-sizing: border-box;
-        }
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
 
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background: #f4f6f8;
-            color: #17202a;
-        }
+<title>Public Profile Inspector</title>
 
-        .container {
-            width: min(1100px, 94%);
-            margin: 40px auto;
-        }
+<style>
 
-        .card {
-            background: white;
-            border-radius: 14px;
-            padding: 25px;
-            margin-bottom: 20px;
-            box-shadow: 0 5px 25px rgba(0,0,0,.07);
-        }
+* {
+    box-sizing: border-box;
+}
 
-        h1 {
-            margin-top: 0;
-        }
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f4f6f8;
+    color: #17202a;
+}
 
-        .subtitle {
-            color: #667085;
-            line-height: 1.6;
-        }
+.container {
+    width: min(1100px, 94%);
+    margin: 40px auto;
+}
 
-        form {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
+.card {
+    background: white;
+    border-radius: 14px;
+    padding: 25px;
+    margin-bottom: 20px;
+    box-shadow: 0 5px 25px rgba(0,0,0,.07);
+}
 
-        input[type="url"] {
-            flex: 1;
-            padding: 14px;
-            border: 1px solid #ccd2d8;
-            border-radius: 8px;
-            font-size: 16px;
-        }
+h1 {
+    margin-top: 0;
+}
 
-        button {
-            border: 0;
-            padding: 14px 22px;
-            border-radius: 8px;
-            background: #111827;
-            color: white;
-            cursor: pointer;
-            font-size: 15px;
-        }
+h2 {
+    margin-top: 0;
+}
 
-        button:hover {
-            opacity: .9;
-        }
+.subtitle {
+    color: #667085;
+    line-height: 1.6;
+}
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-        }
+form {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+}
 
-        .item {
-            background: #f8fafc;
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 10px;
-            overflow-wrap: anywhere;
-        }
+input[type="url"] {
+    flex: 1;
+    padding: 14px;
+    border: 1px solid #ccd2d8;
+    border-radius: 8px;
+    font-size: 16px;
+}
 
-        .label {
-            font-size: 13px;
-            font-weight: bold;
-            color: #667085;
-            text-transform: uppercase;
-            margin-bottom: 6px;
-        }
+button {
+    border: 0;
+    padding: 14px 22px;
+    border-radius: 8px;
+    background: #111827;
+    color: white;
+    cursor: pointer;
+    font-size: 15px;
+}
 
-        .value {
-            font-size: 16px;
-        }
+button:hover {
+    opacity: .9;
+}
 
-        .success {
-            color: #087443;
-        }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 20px;
+}
 
-        .warning {
-            color: #a15c00;
-        }
+.item {
+    background: #f8fafc;
+    padding: 15px;
+    border-radius: 8px;
+    margin-top: 10px;
+    overflow-wrap: anywhere;
+}
 
-        .error {
-            background: #fff1f2;
-            color: #b42318;
-            padding: 15px;
-            border-radius: 8px;
-        }
+.label {
+    font-size: 13px;
+    font-weight: bold;
+    color: #667085;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+}
 
-        ul {
-            padding-left: 20px;
-        }
+.value {
+    font-size: 16px;
+}
 
-        li {
-            margin: 8px 0;
-            overflow-wrap: anywhere;
-        }
+.warning {
+    color: #a15c00;
+}
 
-        a {
-            color: #175cd3;
-            text-decoration: none;
-        }
+.error {
+    background: #fff1f2;
+    color: #b42318;
+    padding: 15px;
+    border-radius: 8px;
+}
 
-        pre {
-            white-space: pre-wrap;
-            overflow-wrap: anywhere;
-            background: #111827;
-            color: #e5e7eb;
-            padding: 15px;
-            border-radius: 8px;
-            max-height: 500px;
-            overflow: auto;
-        }
+.success {
+    color: #087443;
+}
 
-        .notice {
-            font-size: 13px;
-            color: #667085;
-            margin-top: 15px;
-        }
+.notice {
+    font-size: 13px;
+    color: #667085;
+    margin-top: 15px;
+    line-height: 1.5;
+}
 
-        @media (max-width: 700px) {
-            form {
-                flex-direction: column;
-            }
+ul {
+    padding-left: 20px;
+}
 
-            .grid {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
+li {
+    margin: 8px 0;
+    overflow-wrap: anywhere;
+}
+
+a {
+    color: #175cd3;
+    text-decoration: none;
+}
+
+pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: #111827;
+    color: #e5e7eb;
+    padding: 15px;
+    border-radius: 8px;
+    max-height: 500px;
+    overflow: auto;
+}
+
+.badge {
+    display: inline-block;
+    padding: 5px 9px;
+    background: #eef4ff;
+    border-radius: 6px;
+    font-size: 12px;
+    margin-bottom: 8px;
+}
+
+@media (max-width: 700px) {
+
+    form {
+        flex-direction: column;
+    }
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+}
+
+</style>
+
 </head>
 
 <body>
 
 <div class="container">
 
-    <div class="card">
+<div class="card">
 
-        <h1>Public Profile Inspector</h1>
+<h1>Public Profile Inspector</h1>
 
-        <p class="subtitle">
-            Enter a publicly accessible profile or webpage URL.
-            The application analyzes only the HTML returned by the website.
-        </p>
+<p class="subtitle">
+Enter a publicly accessible profile or webpage URL.
+The application analyzes only the HTML returned by the website.
+</p>
 
-        <form method="POST">
+<form method="POST">
 
-            <input
-                type="url"
-                name="url"
-                placeholder="https://example.com/profile"
-                value="{{ url or '' }}"
-                required
-            >
+<input
+    type="url"
+    name="url"
+    placeholder="https://example.com/profile"
+    value="{{ url or '' }}"
+    required
+>
 
-            <button type="submit">
-                Inspect
-            </button>
+<button type="submit">
+Inspect
+</button>
 
-        </form>
+</form>
 
-        <div class="notice">
-            This tool does not log in, bypass authentication, defeat CAPTCHA,
-            or attempt to access private/restricted information.
-        </div>
+<div class="notice">
+This tool does not log in, bypass authentication,
+defeat CAPTCHA, or attempt to access private/restricted
+information.
+</div>
 
-    </div>
+</div>
 
 
-    {% if error %}
+{% if error %}
 
-    <div class="card">
-        <div class="error">
-            {{ error }}
-        </div>
-    </div>
+<div class="card">
 
-    {% endif %}
+<div class="error">
+{{ error }}
+</div>
 
+</div>
 
-    {% if data %}
+{% endif %}
 
-    <div class="card">
 
-        <h2>Basic Information</h2>
+{% if data %}
 
-        <div class="grid">
 
-            <div>
-                <div class="label">Page title</div>
-                <div class="item">{{ data.title or "Not found" }}</div>
-            </div>
+<div class="card">
 
-            <div>
-                <div class="label">OpenGraph title</div>
-                <div class="item">{{ data.og_title or "Not found" }}</div>
-            </div>
+<h2>Basic Information</h2>
 
-            <div>
-                <div class="label">Description</div>
-                <div class="item">
-                    {{ data.description or data.og_description or "Not found" }}
-                </div>
-            </div>
+<div class="grid">
 
-            <div>
-                <div class="label">Detected name/title candidates</div>
+<div>
 
-                <div class="item">
+<div class="label">
+Page title
+</div>
 
-                    {% if data.names %}
+<div class="item">
+{{ data.profile.title or "Not found" }}
+</div>
 
-                        {% for name in data.names %}
-                            <div>{{ name }}</div>
-                        {% endfor %}
+</div>
 
-                    {% else %}
 
-                        Not found
+<div>
 
-                    {% endif %}
+<div class="label">
+OpenGraph title
+</div>
 
-                </div>
+<div class="item">
+{{ data.profile.og_title or "Not found" }}
+</div>
 
-            </div>
+</div>
 
-        </div>
 
-    </div>
+<div>
 
+<div class="label">
+Description
+</div>
 
-    <div class="card">
+<div class="item">
 
-        <h2>Public Contact Information</h2>
+{{ data.profile.description
+   or data.profile.og_description
+   or "Not found" }}
 
-        <p class="notice">
-            These are values that were actually present in the returned page.
-        </p>
+</div>
 
-        <div class="grid">
+</div>
 
-            <div>
 
-                <div class="label">Email addresses</div>
+<div>
 
-                <div class="item">
+<div class="label">
+Name candidates
+</div>
 
-                    {% if data.emails %}
+<div class="item">
 
-                        {% for email in data.emails %}
-                            <div>
-                                <a href="mailto:{{ email }}">
-                                    {{ email }}
-                                </a>
-                            </div>
-                        {% endfor %}
+{% if data.profile.name_candidates %}
 
-                    {% else %}
+{% for name in data.profile.name_candidates %}
 
-                        <span class="warning">
-                            No email found in returned HTML
-                        </span>
+<div>
+{{ name }}
+</div>
 
-                    {% endif %}
+{% endfor %}
 
-                </div>
+{% else %}
 
-            </div>
+Not found
 
+{% endif %}
 
-            <div>
+</div>
 
-                <div class="label">Phone numbers</div>
+</div>
 
-                <div class="item">
+</div>
 
-                    {% if data.phones %}
+</div>
 
-                        {% for phone in data.phones %}
-                            <div>{{ phone }}</div>
-                        {% endfor %}
 
-                    {% else %}
+<div class="card">
 
-                        <span class="warning">
-                            No phone number found in returned HTML
-                        </span>
+<h2>Public Contact Information</h2>
 
-                    {% endif %}
+<p class="notice">
+Only contact information actually exposed by the
+returned HTML is displayed.
+</p>
 
-                </div>
 
-            </div>
+<div class="grid">
 
-        </div>
 
-    </div>
+<div>
 
+<div class="label">
+Email addresses
+</div>
 
-    <div class="card">
+<div class="item">
 
-        <h2>Social Profiles</h2>
+{% if data.contact.emails %}
 
-        {% if data.social_profiles %}
+{% for email in data.contact.emails %}
 
-            <ul>
+<div>
 
-            {% for profile in data.social_profiles %}
+<a href="mailto:{{ email }}">
+{{ email }}
+</a>
 
-                <li>
-                    <strong>{{ profile.name }}:</strong>
-                    <a href="{{ profile.url }}" target="_blank" rel="noopener">
-                        {{ profile.url }}
-                    </a>
-                </li>
+</div>
 
-            {% endfor %}
+{% endfor %}
 
-            </ul>
+{% else %}
 
-        {% else %}
+<span class="warning">
+No email found in returned HTML
+</span>
 
-            <p>No social profiles found.</p>
+{% endif %}
 
-        {% endif %}
+</div>
 
-    </div>
+</div>
 
 
-    <div class="card">
+<div>
 
-        <h2>External Websites</h2>
+<div class="label">
+Phone numbers
+</div>
 
-        {% if data.websites %}
+<div class="item">
 
-            <ul>
+{% if data.contact.phones %}
 
-            {% for website in data.websites %}
+{% for phone in data.contact.phones %}
 
-                <li>
-                    <a href="{{ website }}" target="_blank" rel="noopener">
-                        {{ website }}
-                    </a>
-                </li>
+<div>
+{{ phone }}
+</div>
 
-            {% endfor %}
+{% endfor %}
 
-            </ul>
+{% else %}
 
-        {% else %}
+<span class="warning">
+No phone number exposed through a telephone link
+</span>
 
-            <p>No external websites found.</p>
+{% endif %}
 
-        {% endif %}
+</div>
 
-    </div>
+</div>
 
 
-    {% if data.structured_data %}
+</div>
 
-    <div class="card">
+</div>
 
-        <h2>Structured Data</h2>
 
-        {% for item in data.structured_data %}
+<div class="card">
 
-            <pre>{{ item }}</pre>
+<h2>LinkedIn</h2>
 
-        {% endfor %}
+{% if data.linkedin.profile %}
 
-    </div>
+<div class="item">
 
-    {% endif %}
+<div class="badge">
+Personal profile
+</div>
 
+<br>
 
-    <div class="card">
+<a
+href="{{ data.linkedin.profile }}"
+target="_blank"
+rel="noopener noreferrer"
+>
 
-        <h2>Page Text Preview</h2>
+{{ data.linkedin.profile }}
 
-        <pre>{{ data.page_text_preview }}</pre>
+</a>
 
-    </div>
+</div>
 
-    {% endif %}
+{% else %}
+
+<p>
+No LinkedIn personal profile URL identified.
+</p>
+
+{% endif %}
+
+
+{% if data.linkedin.companies_found %}
+
+<h3>Companies</h3>
+
+<ul>
+
+{% for link in data.linkedin.companies_found %}
+
+<li>
+
+<a
+href="{{ link }}"
+target="_blank"
+rel="noopener noreferrer"
+>
+
+{{ link }}
+
+</a>
+
+</li>
+
+{% endfor %}
+
+</ul>
+
+{% endif %}
+
+
+{% if data.linkedin.posts_found %}
+
+<h3>Posts</h3>
+
+<ul>
+
+{% for link in data.linkedin.posts_found[:20] %}
+
+<li>
+
+<a
+href="{{ link }}"
+target="_blank"
+rel="noopener noreferrer"
+>
+
+{{ link }}
+
+</a>
+
+</li>
+
+{% endfor %}
+
+</ul>
+
+{% endif %}
+
+</div>
+
+
+<div class="card">
+
+<h2>Social Profiles</h2>
+
+{% if data.social_profiles %}
+
+<ul>
+
+{% for profile in data.social_profiles %}
+
+<li>
+
+<strong>
+{{ profile.platform }}:
+</strong>
+
+<a
+href="{{ profile.url }}"
+target="_blank"
+rel="noopener noreferrer"
+>
+
+{{ profile.url }}
+
+</a>
+
+</li>
+
+{% endfor %}
+
+</ul>
+
+{% else %}
+
+<p>
+No supported social profiles found.
+</p>
+
+{% endif %}
+
+</div>
+
+
+<div class="card">
+
+<h2>External Websites</h2>
+
+{% if data.external_websites %}
+
+<ul>
+
+{% for website in data.external_websites %}
+
+<li>
+
+<a
+href="{{ website }}"
+target="_blank"
+rel="noopener noreferrer"
+>
+
+{{ website }}
+
+</a>
+
+</li>
+
+{% endfor %}
+
+</ul>
+
+{% else %}
+
+<p>
+No external websites found.
+</p>
+
+{% endif %}
+
+</div>
+
+
+{% if data.structured_data %}
+
+<div class="card">
+
+<h2>Structured Data</h2>
+
+{% for item in data.structured_data %}
+
+<pre>{{ item }}</pre>
+
+{% endfor %}
+
+</div>
+
+{% endif %}
+
+
+<div class="card">
+
+<h2>Page Text Preview</h2>
+
+<pre>{{ data.page_text_preview }}</pre>
+
+</div>
+
+
+{% endif %}
 
 </div>
 
 </body>
+
 </html>
 """
 
+
+# ============================================================
+# WEB ROUTE
+# ============================================================
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -736,62 +1701,57 @@ def index():
 
     if request.method == "POST":
 
-        url = request.form.get("url", "").strip()
+        url = request.form.get(
+            "url",
+            ""
+        ).strip()
 
-        normalized = normalize_url(url)
+        if not url:
 
-        if not normalized:
-            error = "Please enter a valid HTTP/HTTPS URL."
+            error = "Please enter a URL."
 
         else:
 
             try:
 
-                response = requests.get(
-                    normalized,
-                    headers=HEADERS,
-                    timeout=15,
-                    allow_redirects=True
+                html, final_url = fetch_page(
+                    url
                 )
 
-                if response.status_code >= 400:
-                    error = (
-                        f"The website returned HTTP "
-                        f"{response.status_code}."
-                    )
+                data = extract_data(
+                    html,
+                    final_url
+                )
 
-                else:
-
-                    content_type = response.headers.get(
-                        "Content-Type",
-                        ""
-                    ).lower()
-
-                    if "text/html" not in content_type:
-                        error = (
-                            "The supplied URL did not return an HTML page."
-                        )
-
-                    else:
-
-                        data = extract_data(
-                            response.text,
-                            response.url
-                        )
-
-                        url = response.url
+                url = final_url
 
             except requests.exceptions.Timeout:
-                error = "The website took too long to respond."
+
+                error = (
+                    "The website took too long to respond."
+                )
 
             except requests.exceptions.ConnectionError:
-                error = "Could not connect to the website."
+
+                error = (
+                    "Could not connect to the website."
+                )
 
             except requests.exceptions.RequestException as exc:
-                error = f"Request failed: {exc}"
+
+                error = (
+                    f"Request failed: {str(exc)}"
+                )
+
+            except ValueError as exc:
+
+                error = str(exc)
 
             except Exception as exc:
-                error = f"Unexpected error: {exc}"
+
+                error = (
+                    f"Unexpected error: {str(exc)}"
+                )
 
     return render_template_string(
         HTML,
@@ -801,9 +1761,22 @@ def index():
     )
 
 
+# ============================================================
+# RUN
+# ============================================================
+
 if __name__ == "__main__":
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "6000"
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=6000,
+        port=port,
         debug=False
     )
+```
